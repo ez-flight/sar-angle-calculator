@@ -13,7 +13,6 @@ import os
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point, Polygon
-import matplotlib.pyplot as plt
 
 def get_position(orb: Orbital, utc_time: datetime) -> tuple:
     """Вычисляет положение и скорость спутника"""
@@ -326,42 +325,59 @@ def create_oriented_square_10km(center_lon, center_lat, track_azimuth):
     Аргументы:
         center_lon: долгота центра квадрата (градусы)
         center_lat: широта центра квадрата (градусы)
-        track_azimuth: азимут трассы КА (градусы)
+        track_azimuth: азимут трассы КА (градусы) - направление движения
     
     Возвращает:
         Polygon: квадрат 10x10 км, одна сторона параллельна направлению движения КА
     """
     # Размер квадрата: 10 км (согласно руководству пользователя Кондор-ФКА для детального прожекторного режима)
-    half_size_km = 5.0  # Половина размера квадрата (10 км / 2 = 5 км)
+    half_size_km = 5.0  # Половина стороны квадрата (10 км / 2 = 5 км)
     
-    # Расстояние от центра до угла (диагональ квадрата)
-    diagonal_km = half_size_km * np.sqrt(2)
+    # Для создания квадрата, где одна сторона параллельна трассе:
+    # Используем диагональный подход, но с правильными углами
+    # Расстояние от центра до угла = половина диагонали квадрата
+    diagonal_half_km = half_size_km * np.sqrt(2)
+    
+    # Углы квадрата относительно направления движения (track_azimuth):
+    # Для квадрата со стороной, параллельной трассе:
+    # - Вперед-вправо: track_azimuth + 45° (диагональ вперед-вправо)
+    # - Вперед-влево: track_azimuth - 45° (диагональ вперед-влево)
+    # - Назад-влево: track_azimuth + 135° (диагональ назад-влево)
+    # - Назад-вправо: track_azimuth + 225° (диагональ назад-вправо)
     
     # Вычисляем координаты 4 углов квадрата
-    # Углы квадрата относительно направления движения (track_azimuth):
-    # - Вперед-вправо: track_azimuth + 45°
-    # - Вперед-влево: track_azimuth - 45° (или track_azimuth + 315°)
-    # - Назад-влево: track_azimuth + 135°
-    # - Назад-вправо: track_azimuth + 225°
+    # Для квадрата со стороной, параллельной трассе, углы находятся на диагоналях
+    # Порядок углов по часовой стрелке (для правильного полигона):
+    # 1. Вперед-вправо (северо-восток, если track_azimuth = 0°)
+    # 2. Назад-вправо (юго-восток)
+    # 3. Назад-влево (юго-запад)
+    # 4. Вперед-влево (северо-запад)
     
-    # Вычисляем азимуты для каждого угла
-    corner_azimuths = [
-        (track_azimuth + 45) % 360,    # Вперед-вправо
-        (track_azimuth - 45) % 360,    # Вперед-влево (или +315)
-        (track_azimuth + 135) % 360,  # Назад-влево
-        (track_azimuth + 225) % 360   # Назад-вправо
+    corner1_lon, corner1_lat = move_point_by_distance_azimuth(
+        center_lon, center_lat, diagonal_half_km, (track_azimuth + 45) % 360
+    )
+    
+    corner2_lon, corner2_lat = move_point_by_distance_azimuth(
+        center_lon, center_lat, diagonal_half_km, (track_azimuth + 135) % 360
+    )
+    
+    corner3_lon, corner3_lat = move_point_by_distance_azimuth(
+        center_lon, center_lat, diagonal_half_km, (track_azimuth + 225) % 360
+    )
+    
+    corner4_lon, corner4_lat = move_point_by_distance_azimuth(
+        center_lon, center_lat, diagonal_half_km, (track_azimuth - 45) % 360
+    )
+    
+    # Создаем полигон в правильном порядке (по часовой стрелке)
+    # Порядок: вперед-вправо, назад-вправо, назад-влево, вперед-влево
+    corners = [
+        (corner1_lon, corner1_lat),  # Вперед-вправо
+        (corner2_lon, corner2_lat),  # Назад-вправо
+        (corner3_lon, corner3_lat),  # Назад-влево
+        (corner4_lon, corner4_lat)   # Вперед-влево
     ]
     
-    # Вычисляем координаты углов
-    corners = []
-    for azimuth in corner_azimuths:
-        corner_lon, corner_lat = move_point_by_distance_azimuth(
-            center_lon, center_lat, diagonal_km, azimuth
-        )
-        corners.append((corner_lon, corner_lat))
-    
-    # Создаем полигон (порядок углов важен для правильной ориентации)
-    # Порядок: вперед-вправо, вперед-влево, назад-влево, назад-вправо
     return Polygon(corners)
 
 def is_target_visible(sat_pos, target_pos, utc_time):
@@ -453,8 +469,7 @@ def is_target_visible(sat_pos, target_pos, utc_time):
 def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_pos, output_file='result/periods_points.gpkg'):
     """
     Сохранить все точки КА периода в GPKG файл
-    Частота определения координат автоматически подстраивается под длительность периода,
-    чтобы гарантировать минимум 10 точек на период
+    Частота определения координат: фиксированный шаг 0.1 секунды внутри периода (10 точек в секунду)
     
     Аргументы:
         period_start: datetime - начало периода
@@ -472,17 +487,20 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
     # Вычисляем длительность периода
     period_duration_seconds = (period_end - period_start).total_seconds()
     
-    # Минимальное количество точек на период
-    min_points_per_period = 10
+    # Расчет количества снимков в детальном прожекторном режиме (ДПР)
+    images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+        period_duration_seconds,
+        image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+        antenna_switch_time=2.0       # Время переключения антенны (сек)
+    )
     
-    # Начальный шаг: пытаемся получить достаточно точек с учетом высокой фильтрации
-    # Из опыта видно, что фильтруется ~90-95% точек, поэтому нужен большой запас
-    # Начинаем с шага, который даст минимум 300 точек для генерации (запас в 30 раз)
-    # Это гарантирует, что даже при высокой фильтрации мы получим минимум 10 валидных точек
-    initial_step = period_duration_seconds / (min_points_per_period * 30)  # Запас в 30 раз
+    # Параметры цикла съемки
+    image_acquisition_time = 10.0  # Время синтеза апертуры для одного кадра (сек)
+    antenna_switch_time = 2.0      # Время переключения антенны (сек)
+    cycle_time = image_acquisition_time + antenna_switch_time  # 12 секунд
     
-    # Базовый шаг: не больше 5 секунд (для более частой выборки), не меньше 0.1 секунды
-    point_step_seconds = min(5.0, max(0.1, initial_step))
+    # Фиксированный шаг 0.1 секунды внутри периода (10 точек в секунду)
+    point_step_seconds = 0.1
     
     geometries = []
     attributes = []
@@ -503,7 +521,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             # Важно: получаем координаты для ТОЧНОГО момента времени current_time
             X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, current_time)
             sat_pos_eci = (X_s, Y_s, Z_s)
-            
+        
             # Преобразуем координаты из ECI в географические для большей точности
             # Используем get_lonlatalt для более точного преобразования с учетом времени
             try:
@@ -551,6 +569,33 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 wavelength=0.031  # X-диапазон (можно сделать параметром)
             )
             
+            # Определяем, какому снимку соответствует эта точка
+            # Вычисляем время от начала периода в секундах
+            time_from_start = (current_time - period_start).total_seconds()
+            image_number = None
+            
+            # Проверяем, попадает ли точка во время какого-либо снимка
+            # Снимки идут последовательно:
+            # - Снимок 1: от 0.0 до 10.0 сек
+            # - Переключение: от 10.0 до 12.0 сек (не сохраняем)
+            # - Снимок 2: от 12.0 до 22.0 сек
+            # - Переключение: от 22.0 до 24.0 сек (не сохраняем)
+            # - И так далее...
+            
+            if images_count > 0 and time_from_start >= 0.0:
+                # Проверяем каждый возможный снимок
+                for img_num in range(1, images_count + 1):
+                    # Время начала снимка (секунды от начала периода)
+                    image_start_time = (img_num - 1) * cycle_time
+                    # Время окончания снимка (начало + время съемки)
+                    image_end_time = image_start_time + image_acquisition_time
+                    
+                    # Проверяем, попадает ли точка во время этого снимка
+                    if image_start_time <= time_from_start < image_end_time:
+                        image_number = img_num
+                        break
+                # Если точка не попала ни в один снимок (время переключения), image_number остается None
+            
             # Создаем точку местоположения КА с высокой точностью
             sat_point = Point(lon_sat, lat_sat)
             geometries.append(sat_point)
@@ -559,6 +604,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             attrs = {
                 'period_id': period_id,
                 'point_id': point_count,
+                'image_number': image_number,  # Номер снимка, которому соответствует точка (None если время переключения)
                 'time': current_time.strftime('%Y-%m-%d %H:%M:%S.%f'),
                 'start_time': period_start.strftime('%Y-%m-%d %H:%M:%S.%f'),
                 'end_time': period_end.strftime('%Y-%m-%d %H:%M:%S.%f'),
@@ -568,8 +614,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 'angle_traverse': round(angle, 6),  # Угол между КА и объектом относительно траверса (88-92°)
                 'distance': round(distance, 2),
                 'max_dist': round(max_distance, 2),
-                'doppler_freq': round(doppler_freq, 3),  # Доплеровская частота в Гц
-                'visible': 1 if is_visible else 0
+                'doppler_freq': round(doppler_freq, 3)  # Доплеровская частота в Гц
             }
             attributes.append(attrs)
             point_count += 1
@@ -582,18 +627,6 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
         
         # Переходим к следующей точке
         current_time += timedelta(seconds=point_step_seconds)
-        
-        # Адаптивное уменьшение шага: если валидных точек мало, уменьшаем шаг
-        # Проверяем каждые 5 итераций, чтобы не делать это слишком часто
-        if point_count > 0 and point_count % 5 == 0:
-            # Если процент валидных точек меньше 10% и валидных точек меньше минимума
-            valid_percentage = (valid_points_count / point_count) * 100 if point_count > 0 else 0
-            if valid_percentage < 10.0 and valid_points_count < min_points_per_period and current_time <= period_end:
-                # Уменьшаем шаг в 2 раза, но не меньше 0.1 секунды
-                if point_step_seconds > 0.1:
-                    old_step = point_step_seconds
-                    point_step_seconds = max(0.1, point_step_seconds / 2.0)
-                    # print(f"    Уменьшен шаг с {old_step:.2f} до {point_step_seconds:.2f} сек (валидных: {valid_points_count}/{point_count}, {valid_percentage:.1f}%)")
     
     # Сохраняем точки в GPKG файл
     if len(geometries) > 0:
@@ -603,33 +636,66 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
         
         for i, attr in enumerate(attributes):
             angle_val = attr.get('angle_traverse')
+            image_number_val = attr.get('image_number')
+            
             # Проверяем, что угол валиден и в диапазоне 88-92
-            if angle_val is not None and not (isinstance(angle_val, float) and (np.isnan(angle_val) or np.isinf(angle_val))):
-                if angle_min <= angle_val <= angle_max:
-                    valid_geometries.append(geometries[i])
-                    valid_attributes.append(attr)
-                else:
-                    filtered_by_angle_count += 1
+            angle_valid = angle_val is not None and not (isinstance(angle_val, float) and (np.isnan(angle_val) or np.isinf(angle_val)))
+            angle_in_range = angle_valid and (angle_min <= angle_val <= angle_max)
+            
+            # Проверяем, что image_number не равен None (точка должна попадать в интервал активной съемки)
+            image_number_valid = image_number_val is not None
+            
+            # Сохраняем только точки с валидным углом И валидным номером снимка
+            if angle_in_range and image_number_valid:
+                valid_geometries.append(geometries[i])
+                valid_attributes.append(attr)
             else:
-                filtered_by_angle_count += 1
+                if not angle_in_range:
+                    filtered_by_angle_count += 1
+                # Если image_number == None, точка во время переключения антенны - не сохраняем
         
         if len(valid_geometries) > 0:
             new_gdf = gpd.GeoDataFrame(valid_attributes, geometry=valid_geometries, crs='EPSG:4326')
             
             # Проверяем, существует ли уже файл
             if os.path.exists(output_file):
-                # Читаем существующий файл и добавляем новые точки
+                # Читаем существующий файл
                 try:
                     existing_gdf = gpd.read_file(output_file, layer='periods_points')
+                    
+                    # Удаляем все точки текущего периода, чтобы избежать дубликатов
+                    if 'period_id' in existing_gdf.columns:
+                        existing_gdf = existing_gdf[existing_gdf['period_id'] != period_id]
+                    
                     # Дополнительная фильтрация существующих данных (на случай, если там есть невалидные)
+                    # Фильтруем по углу и по image_number (должен быть не NULL)
+                    filter_conditions = []
                     if 'angle_traverse' in existing_gdf.columns:
-                        existing_gdf = existing_gdf[
+                        filter_conditions.append(
                             (existing_gdf['angle_traverse'] >= angle_min) & 
                             (existing_gdf['angle_traverse'] <= angle_max) &
                             (existing_gdf['angle_traverse'].notna())
-                        ]
-                    # Объединяем существующие и новые данные
+                        )
+                    if 'image_number' in existing_gdf.columns:
+                        filter_conditions.append(existing_gdf['image_number'].notna())
+                    
+                    if filter_conditions:
+                        # Объединяем все условия фильтрации
+                        combined_filter = filter_conditions[0]
+                        for condition in filter_conditions[1:]:
+                            combined_filter = combined_filter & condition
+                        existing_gdf = existing_gdf[combined_filter]
+                    
+                    # Объединяем существующие данные (без текущего периода) и новые данные
                     combined_gdf = gpd.GeoDataFrame(pd.concat([existing_gdf, new_gdf], ignore_index=True), crs='EPSG:4326')
+                    
+                    # Дополнительная проверка на дубликаты по уникальному ключу (period_id, point_id, time)
+                    if 'period_id' in combined_gdf.columns and 'point_id' in combined_gdf.columns and 'time' in combined_gdf.columns:
+                        initial_combined_count = len(combined_gdf)
+                        combined_gdf = combined_gdf.drop_duplicates(subset=['period_id', 'point_id', 'time'], keep='first')
+                        if len(combined_gdf) < initial_combined_count:
+                            print(f"    ⚠️  Удалено {initial_combined_count - len(combined_gdf)} дубликатов при сохранении периода {period_id}")
+                    
                     combined_gdf.to_file(output_file, driver='GPKG', layer='periods_points')
                 except Exception as e:
                     # Если не удалось прочитать, создаем новый или перезаписываем
@@ -638,21 +704,12 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 # Создаем новый файл
                 new_gdf.to_file(output_file, driver='GPKG', layer='periods_points')
         
-        # Создаем и сохраняем квадратную рамку 10x10 км для детального прожекторного режима (ДПР)
+        # Создаем и сохраняем квадратные рамки 10x10 км для каждого снимка в детальном прожекторном режиме (ДПР)
         try:
-            # Вычисляем среднее время периода для расчета азимута трассы
-            mid_time = period_start + (period_end - period_start) / 2
-            
-            # Вычисляем азимут трассы КА
-            track_azimuth = calculate_track_azimuth(orb, mid_time)
-            
             # Получаем координаты целевой точки
             lat_t, lon_t, alt_t = target_pos
             
-            # Создаем квадрат 10x10 км для детального прожекторного режима, ориентированный вдоль трассы КА
-            square_polygon = create_oriented_square_10km(lon_t, lat_t, track_azimuth)
-            
-            # Расчет количества снимков в детальном прожекторном режиме (ДПР) для квадратной рамки
+            # Расчет количества снимков в детальном прожекторном режиме (ДПР)
             period_duration_seconds = (period_end - period_start).total_seconds()
             images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
                 period_duration_seconds,
@@ -660,47 +717,80 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 antenna_switch_time=2.0       # Время переключения антенны (сек)
             )
             
-            # Создаем GeoDataFrame для квадрата
-            square_attrs = {
-                'period_id': period_id,
-                'type': 'square_frame',
-                'size_km': 10.0,  # Размер кадра в детальном прожекторном режиме согласно руководству Кондор-ФКА
-                'center_lon': round(lon_t, 9),
-                'center_lat': round(lat_t, 9),
-                'track_azimuth': round(track_azimuth, 6),
-                'start_time': period_start.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                'end_time': period_end.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                'spotlight_images_count': images_count,  # Количество снимков в ДПР
-                'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки в ДПР (сек)
-                'spotlight_residual_time': round(residual_time, 1)  # Остаточное время периода после съемки (сек)
-            }
-            square_gdf = gpd.GeoDataFrame([square_attrs], geometry=[square_polygon], crs='EPSG:4326')
+            # Создаем рамку для каждого снимка
+            squares_list = []
+            cycle_time = 10.0 + 2.0  # image_acquisition_time + antenna_switch_time
             
-            # Сохраняем квадрат в отдельный слой GPKG файла
-            if os.path.exists(output_file):
-                try:
-                    # Пытаемся прочитать существующий слой с квадратами
+            for image_num in range(1, images_count + 1):
+                # Вычисляем время начала снимка
+                # Первый снимок начинается в начале периода
+                # Каждый последующий снимок начинается после завершения предыдущего цикла (съемка + переключение)
+                image_start_time = period_start + timedelta(seconds=(image_num - 1) * cycle_time)
+                
+                # Время окончания снимка (начало + время синтеза апертуры)
+                image_end_time = image_start_time + timedelta(seconds=10.0)
+                
+                # Вычисляем азимут трассы КА в момент начала снимка
+                track_azimuth = calculate_track_azimuth(orb, image_start_time)
+                
+                # Создаем квадрат 10x10 км для детального прожекторного режима, ориентированный вдоль трассы КА
+                square_polygon = create_oriented_square_10km(lon_t, lat_t, track_azimuth)
+                
+                # Создаем атрибуты для рамки снимка
+                square_attrs = {
+                    'period_id': period_id,
+                    'image_number': image_num,  # Номер снимка в периоде (начиная с 1)
+                    'type': 'square_frame',
+                    'size_km': 10.0,  # Размер кадра в детальном прожекторном режиме согласно руководству Кондор-ФКА
+                    'center_lon': round(lon_t, 9),
+                    'center_lat': round(lat_t, 9),
+                    'track_azimuth': round(track_azimuth, 6),
+                    'image_start_time': image_start_time.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    'image_end_time': image_end_time.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    'period_start_time': period_start.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    'period_end_time': period_end.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    'spotlight_images_count': images_count,  # Общее количество снимков в периоде
+                    'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки в ДПР (сек)
+                    'spotlight_residual_time': round(residual_time, 1)  # Остаточное время периода после съемки (сек)
+                }
+                squares_list.append({'geometry': square_polygon, **square_attrs})
+            
+            # Создаем GeoDataFrame для всех квадратов периода
+            if squares_list:
+                squares_data = []
+                squares_geometries = []
+                for sq in squares_list:
+                    geometry = sq.pop('geometry')
+                    squares_geometries.append(geometry)
+                    squares_data.append(sq)
+                
+                square_gdf = gpd.GeoDataFrame(squares_data, geometry=squares_geometries, crs='EPSG:4326')
+                
+                # Сохраняем квадраты в отдельный слой GPKG файла
+                if os.path.exists(output_file):
                     try:
-                        existing_squares_gdf = gpd.read_file(output_file, layer='periods_squares')
-                        # Фильтруем квадраты текущего периода (если они уже есть)
-                        existing_squares_gdf = existing_squares_gdf[existing_squares_gdf['period_id'] != period_id]
-                        # Объединяем существующие и новые квадраты
-                        combined_squares_gdf = gpd.GeoDataFrame(
-                            pd.concat([existing_squares_gdf, square_gdf], ignore_index=True), 
-                            crs='EPSG:4326'
-                        )
-                        combined_squares_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
-                    except:
-                        # Если слой не существует, создаем новый
+                        # Пытаемся прочитать существующий слой с квадратами
+                        try:
+                            existing_squares_gdf = gpd.read_file(output_file, layer='periods_squares')
+                            # Фильтруем квадраты текущего периода (если они уже есть)
+                            existing_squares_gdf = existing_squares_gdf[existing_squares_gdf['period_id'] != period_id]
+                            # Объединяем существующие и новые квадраты
+                            combined_squares_gdf = gpd.GeoDataFrame(
+                                pd.concat([existing_squares_gdf, square_gdf], ignore_index=True), 
+                                crs='EPSG:4326'
+                            )
+                            combined_squares_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
+                        except:
+                            # Если слой не существует, создаем новый
+                            square_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
+                    except Exception as e:
+                        # Если не удалось, создаем новый слой
                         square_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
-                except Exception as e:
-                    # Если не удалось, создаем новый слой
+                else:
+                    # Если файл не существует, создаем новый (точки уже создали файл, но на всякий случай)
                     square_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
-            else:
-                # Если файл не существует, создаем новый (точки уже создали файл, но на всякий случай)
-                square_gdf.to_file(output_file, driver='GPKG', layer='periods_squares')
         except Exception as e:
-            print(f"    ⚠️  Предупреждение: не удалось создать квадрат для периода {period_id}: {e}")
+            print(f"    ⚠️  Предупреждение: не удалось создать квадраты для периода {period_id}: {e}")
         
         # Выводим информацию о сохранении
         period_duration_str = f"{period_duration_seconds:.1f} сек"
@@ -709,14 +799,83 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
         else:
             period_duration_str = f"{period_duration_seconds/60:.2f} мин"
         
-        if filtered_by_angle_count > 0:
-            print(f"  Период {period_id} (длительность: {period_duration_str}, шаг: {point_step_seconds:.2f} сек): сохранено {len(valid_geometries)} точек в GPKG (отфильтровано по углу: {filtered_by_angle_count})")
-        else:
-            print(f"  Период {period_id} (длительность: {period_duration_str}, шаг: {point_step_seconds:.2f} сек): сохранено {len(valid_geometries)} точек в GPKG")
+        # Статистика по image_number для отладки
+        if len(valid_attributes) > 0:
+            image_number_stats = {}
+            for attr in valid_attributes:
+                img_num = attr.get('image_number')
+                if img_num not in image_number_stats:
+                    image_number_stats[img_num] = 0
+                image_number_stats[img_num] += 1
+            
+            image_stats_str = ", ".join([f"снимок {k}: {image_number_stats[k]}" for k in sorted([x for x in image_number_stats.keys() if x is not None])])
+            if filtered_by_angle_count > 0:
+                print(f"  Период {period_id} (длительность: {period_duration_str}, шаг: {point_step_seconds:.1f} сек): сохранено {len(valid_geometries)} точек в GPKG (отфильтровано по углу: {filtered_by_angle_count})")
+                if image_stats_str:
+                    print(f"    Распределение по снимкам: {image_stats_str}")
+            else:
+                print(f"  Период {period_id} (длительность: {period_duration_str}, шаг: {point_step_seconds:.1f} сек): сохранено {len(valid_geometries)} точек в GPKG")
+                if image_stats_str:
+                    print(f"    Распределение по снимкам: {image_stats_str}")
+
+def find_exact_period_start(approx_start_time, orb, target_pos, time_step_seconds=1.0):
+    """
+    Точный поиск начала периода с шагом 1 секунда
+    Возвращается назад на 10 секунд от приблизительного начала и ищет точное начало
+    
+    Аргументы:
+        approx_start_time: datetime - приблизительное время начала периода (обнаружено с шагом 10 сек)
+        orb: объект Orbital
+        target_pos: кортеж (широта, долгота, высота) целевой точки
+        time_step_seconds: шаг времени для точного поиска (секунды), по умолчанию 1.0
+    
+    Возвращает:
+        datetime - точное время начала периода
+    """
+    # Отступаем на 10 секунд назад от приблизительного начала
+    search_start = approx_start_time - timedelta(seconds=10.0)
+    current_time = search_start
+    
+    angle_min = 88.0
+    angle_max = 92.0
+    period_start = None
+    
+    # Ищем точное начало периода с шагом 1 секунда
+    while current_time <= approx_start_time:
+        try:
+            # Получаем координаты спутника и цели в ECI
+            X_s, Y_s, Z_s, _, _, _ = get_position(orb, current_time)
+            sat_pos_eci = (X_s, Y_s, Z_s)
+            
+            lat_t, lon_t, alt_t = target_pos
+            pos_tgt_eci, _ = get_xyzv_from_latlon(current_time, lon_t, lat_t, alt_t)
+            target_pos_eci = pos_tgt_eci
+            
+            # Проверяем видимость
+            is_visible, distance, max_distance = is_target_visible(sat_pos_eci, target_pos_eci, current_time)
+            
+            if is_visible:
+                # Вычисляем угол между вектором на цель и направлением скорости
+                angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos)
+                
+                # Проверяем, что угол валиден
+                if angle is not None and not (isinstance(angle, float) and (np.isnan(angle) or np.isinf(angle))):
+                    if angle_min <= angle <= angle_max:
+                        if period_start is None:
+                            # Нашли начало периода
+                            period_start = current_time
+                    else:
+                        # Если угол вышел за пределы, но период уже начался - это конец поиска
+                        if period_start is not None:
+                            break
+        except Exception:
+            # Пропускаем точку при ошибке
+            pass
         
-        # Предупреждение, если точек меньше минимума
-        if len(valid_geometries) < min_points_per_period:
-            print(f"    ⚠️  Внимание: сохранено только {len(valid_geometries)} точек, что меньше минимума {min_points_per_period}")
+        current_time += timedelta(seconds=time_step_seconds)
+    
+    # Если не нашли точное начало, возвращаем приблизительное
+    return period_start if period_start is not None else approx_start_time
 
 def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=1.0, min_period_duration=30.0, R0_min=None, R0_max=None, num_days=1):
     """
@@ -799,8 +958,8 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
             visible_count += 1
             
             if period_start is None:
-                # Начало нового периода
-                period_start = current_time
+                # Начало нового периода - делаем точный поиск начала с шагом 1 секунда
+                period_start = find_exact_period_start(current_time, orb, target_pos, time_step_seconds=1.0)
                 period_angle = angle
             else:
                 # Продолжение периода - обновляем угол (средний)
@@ -895,6 +1054,66 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
     print(f"  Найдено периодов видимости: {len(sequence)}")
     
     return sequence
+
+def export_gpkg_attributes_to_txt(gpkg_file='result/periods_points.gpkg', txt_file='result/periods_points.txt'):
+    """
+    Экспортирует атрибуты из GPKG файла в текстовый файл для анализа
+    
+    Аргументы:
+        gpkg_file: путь к GPKG файлу
+        txt_file: путь к выходному текстовому файлу
+    """
+    try:
+        if not os.path.exists(gpkg_file):
+            print(f"  Предупреждение: GPKG файл {gpkg_file} не найден, экспорт пропущен")
+            return
+        
+        # Читаем GPKG файл
+        gdf = gpd.read_file(gpkg_file, layer='periods_points')
+        
+        if len(gdf) == 0:
+            print(f"  Предупреждение: GPKG файл {gpkg_file} пуст, экспорт пропущен")
+            return
+        
+        # Удаляем дубликаты по уникальному ключу: period_id, point_id, time
+        if 'period_id' in gdf.columns and 'point_id' in gdf.columns and 'time' in gdf.columns:
+            initial_count = len(gdf)
+            # Удаляем дубликаты, оставляя первую запись
+            gdf = gdf.drop_duplicates(subset=['period_id', 'point_id', 'time'], keep='first')
+            duplicates_removed = initial_count - len(gdf)
+            if duplicates_removed > 0:
+                print(f"  Удалено дубликатов: {duplicates_removed} (было {initial_count}, стало {len(gdf)})")
+        
+        # Создаем папку result, если её нет
+        output_dir = os.path.dirname(txt_file)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Получаем все колонки (кроме geometry, angle и visible)
+        columns = [col for col in gdf.columns if col != 'geometry' and col != 'angle' and col != 'visible']
+        
+        # Открываем файл для записи
+        with open(txt_file, 'w', encoding='utf-8') as f:
+            # Записываем заголовок
+            f.write('\t'.join(columns) + '\n')
+            
+            # Записываем данные
+            for idx, row in gdf.iterrows():
+                values = []
+                for col in columns:
+                    val = row[col]
+                    if val is None:
+                        values.append('')
+                    elif isinstance(val, (int, float)):
+                        values.append(str(val))
+                    else:
+                        values.append(str(val))
+                f.write('\t'.join(values) + '\n')
+        
+        print(f"  Атрибуты экспортированы в текстовый файл: {txt_file} ({len(gdf)} записей)")
+        
+    except Exception as e:
+        print(f"  Предупреждение: не удалось экспортировать атрибуты в текстовый файл: {e}")
 
 def continuous_angle_sequence():
     """
@@ -1029,13 +1248,19 @@ def continuous_angle_sequence():
                 
                 print(f"   Промежуток до следующего периода: {gap:.1f} сек ({gap/60:.2f} мин)")
                 print(f"   Пройденное расстояние КА: {distance_km:.2f} км")
-                print(f"   Средняя скорость КА: {avg_velocity_km_s:.3f} км/с ({avg_velocity_km_h:.1f} км/ч)")
             except Exception as e:
                 print(f"   Промежуток до следующего периода: {gap:.1f} сек ({gap/60:.2f} мин)")
                 print(f"   (Не удалось вычислить расстояние и скорость: {e})")
 
+    # Подсчитываем общее количество снимков
+    total_images = 0
+    for item in sequence:
+        if 'spotlight_images_count' in item:
+            total_images += item['spotlight_images_count']
+
     print("\nОБЩАЯ СТАТИСТИКА:")
     print(f"  Всего периодов видимости: {len(sequence)}")
+    print(f"  Общее количество снимков: {total_images}")
     print(f"  Общая длительность съемки: {total_duration:.3f} сек ({total_duration/60:.2f} мин, {total_duration/3600:.2f} часов)")
     
     if len(sequence) > 1:
@@ -1045,72 +1270,28 @@ def continuous_angle_sequence():
         efficiency = total_duration / total_time * 100 if total_time > 0 else 0
         print(f"  Эффективность использования времени: {efficiency:.1f}%")
     
-    # Построение гистограммы продолжительности периодов обзора
+    # Статистика по продолжительности периодов обзора
     if len(sequence) > 0:
-        try:
-            # Собираем данные о продолжительности периодов
-            durations = [item['period_duration'] for item in sequence]
-            durations_minutes = [d / 60.0 for d in durations]  # Переводим в минуты для удобства
-            
-            # Вычисляем статистику
-            avg_duration = np.mean(durations_minutes)
-            median_duration = np.median(durations_minutes)
-            min_duration = np.min(durations_minutes)
-            max_duration = np.max(durations_minutes)
-            std_duration = np.std(durations_minutes)
-            
-            print(f"\nСТАТИСТИКА ПО ПРОДОЛЖИТЕЛЬНОСТИ ПЕРИОДОВ:")
-            print(f"  Средняя продолжительность: {avg_duration:.2f} мин ({avg_duration*60:.1f} сек)")
-            print(f"  Медианная продолжительность: {median_duration:.2f} мин ({median_duration*60:.1f} сек)")
-            print(f"  Минимальная продолжительность: {min_duration:.2f} мин ({min_duration*60:.1f} сек)")
-            print(f"  Максимальная продолжительность: {max_duration:.2f} мин ({max_duration*60:.1f} сек)")
-            print(f"  Стандартное отклонение: {std_duration:.2f} мин ({std_duration*60:.1f} сек)")
-            
-            # Создаем папку result, если её нет
-            result_dir = 'result'
-            if not os.path.exists(result_dir):
-                os.makedirs(result_dir)
-            
-            # Построение гистограммы
-            plt.figure(figsize=(12, 6))
-            
-            # Определяем количество интервалов (bins) для гистограммы
-            n_bins = min(30, max(10, len(durations) // 2))  # От 10 до 30 интервалов
-            
-            # Строим гистограмму
-            n, bins, patches = plt.hist(durations_minutes, bins=n_bins, edgecolor='black', alpha=0.7, color='steelblue')
-            
-            # Добавляем вертикальную линию для среднего значения
-            plt.axvline(avg_duration, color='red', linestyle='--', linewidth=2, label=f'Среднее: {avg_duration:.2f} мин')
-            
-            # Добавляем вертикальную линию для медианы
-            plt.axvline(median_duration, color='green', linestyle='--', linewidth=2, label=f'Медиана: {median_duration:.2f} мин')
-            
-            # Настройка графика
-            plt.xlabel('Продолжительность периода обзора (минуты)', fontsize=12)
-            plt.ylabel('Количество периодов', fontsize=12)
-            plt.title(f'Гистограмма продолжительности периодов обзора\nВсего периодов: {len(sequence)}', fontsize=14, fontweight='bold')
-            plt.grid(True, alpha=0.3, linestyle='--')
-            plt.legend(fontsize=10)
-            
-            # Добавляем текстовую информацию о статистике
-            stats_text = f'Среднее: {avg_duration:.2f} мин\nМедиана: {median_duration:.2f} мин\nМин: {min_duration:.2f} мин\nМакс: {max_duration:.2f} мин\nСт.откл.: {std_duration:.2f} мин'
-            plt.text(0.98, 0.98, stats_text, transform=plt.gca().transAxes,
-                    fontsize=9, verticalalignment='top', horizontalalignment='right',
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            plt.tight_layout()
-            
-            # Сохраняем гистограмму
-            histogram_path = os.path.join(result_dir, 'duration_histogram.png')
-            plt.savefig(histogram_path, dpi=300, bbox_inches='tight')
-            print(f"\nГистограмма сохранена: {histogram_path}")
-            
-            # Закрываем фигуру для освобождения памяти
-            plt.close()
-            
-        except Exception as e:
-            print(f"\nПредупреждение: не удалось построить гистограмму: {e}")
+        # Собираем данные о продолжительности периодов
+        durations = [item['period_duration'] for item in sequence]
+        durations_minutes = [d / 60.0 for d in durations]  # Переводим в минуты для удобства
+        
+        # Вычисляем статистику
+        avg_duration = np.mean(durations_minutes)
+        median_duration = np.median(durations_minutes)
+        min_duration = np.min(durations_minutes)
+        max_duration = np.max(durations_minutes)
+        std_duration = np.std(durations_minutes)
+        
+        print(f"\nСТАТИСТИКА ПО ПРОДОЛЖИТЕЛЬНОСТИ ПЕРИОДОВ:")
+        print(f"  Средняя продолжительность: {avg_duration:.2f} мин ({avg_duration*60:.1f} сек)")
+        print(f"  Медианная продолжительность: {median_duration:.2f} мин ({median_duration*60:.1f} сек)")
+        print(f"  Минимальная продолжительность: {min_duration:.2f} мин ({min_duration*60:.1f} сек)")
+        print(f"  Максимальная продолжительность: {max_duration:.2f} мин ({max_duration*60:.1f} сек)")
+        print(f"  Стандартное отклонение: {std_duration:.2f} мин ({std_duration*60:.1f} сек)")
+    
+    # Экспорт атрибутов GPKG в текстовый файл для анализа
+    export_gpkg_attributes_to_txt()
     
     print("=" * 80)
 
