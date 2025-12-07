@@ -40,6 +40,90 @@ def calculate_traverse_angle_at_time(target_time, orb, target_pos):
     angle = calculate_traverse_angle(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s, X_t, Y_t, Z_t)
     return angle
 
+def calculate_spotlight_images_count(period_duration_seconds, 
+                                      image_acquisition_time=10.0, 
+                                      antenna_switch_time=2.0):
+    """
+    Рассчитывает количество снимков в детальном прожекторном режиме (ДПР) за период наблюдения
+    
+    Согласно руководству пользователя Кондор-ФКА, в детальном прожекторном режиме:
+    - Время синтеза апертуры для одного кадра: ~10 секунд
+    - Время переключения антенны между кадрами: ~2 секунды
+    - Общий цикл на кадр: ~12 секунд
+    
+    Аргументы:
+        period_duration_seconds: длительность периода наблюдения в секундах
+        image_acquisition_time: время синтеза апертуры для одного кадра (секунды), по умолчанию 10.0
+        antenna_switch_time: время переключения антенны между кадрами (секунды), по умолчанию 2.0
+    
+    Возвращает:
+        кортеж (количество_снимков, общее_время_циклов, остаточное_время)
+    """
+    cycle_time = image_acquisition_time + antenna_switch_time
+    
+    if period_duration_seconds < image_acquisition_time:
+        # Если период короче времени одного кадра, можно сделать только 0 снимков
+        return 0, 0.0, period_duration_seconds
+    
+    # Количество полных циклов (каждый цикл = съемка + переключение)
+    full_cycles = int(period_duration_seconds / cycle_time)
+    
+    # Остаточное время после полных циклов
+    remaining_time = period_duration_seconds - (full_cycles * cycle_time)
+    
+    # Если остаточного времени достаточно для еще одного кадра (без переключения в конце)
+    if remaining_time >= image_acquisition_time:
+        images_count = full_cycles + 1
+        total_cycle_time = full_cycles * cycle_time + image_acquisition_time
+        residual_time = remaining_time - image_acquisition_time
+    else:
+        images_count = full_cycles
+        total_cycle_time = full_cycles * cycle_time
+        residual_time = remaining_time
+    
+    return images_count, total_cycle_time, residual_time
+
+def calculate_doppler_frequency(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s, X_t, Y_t, Z_t, wavelength=0.10):
+    """
+    Вычисляет доплеровскую частоту принимаемого сигнала согласно статье Зайцева В.В.
+    
+    Формула: f_D = -2/λ * dR_0/dt = -2/λ * (V_s · R_target) / R_0
+    
+    где:
+    - λ - длина волны РСА (м)
+    - V_s - вектор скорости космического аппарата
+    - R_target - вектор от космического аппарата к цели
+    - R_0 - наклонная дальность
+    
+    Аргументы:
+        X_s, Y_s, Z_s: координаты космического аппарата в ГИСК (м)
+        Vx_s, Vy_s, Vz_s: компоненты скорости космического аппарата в ГИСК (м/с)
+        X_t, Y_t, Z_t: координаты цели в ГИСК (м)
+        wavelength: длина волны РСА в метрах (по умолчанию 0.031 м для X-диапазона)
+    
+    Возвращает:
+        доплеровская частота в Гц
+    """
+    # Вектор от КА к цели
+    R_target = np.array([X_t - X_s, Y_t - Y_s, Z_t - Z_s])
+    
+    # Наклонная дальность
+    R_0 = np.linalg.norm(R_target)
+    
+    if R_0 == 0:
+        return 0.0
+    
+    # Вектор скорости КА
+    V_s = np.array([Vx_s, Vy_s, Vz_s])
+    
+    # Скалярное произведение: V_s · R_target
+    V_dot_R = np.dot(V_s, R_target)
+    
+    # Доплеровская частота: f_D = -2/λ * (V_s · R_target) / R_0
+    f_D = -2.0 / wavelength * V_dot_R / R_0
+    
+    return f_D
+
 def calculate_angle_from_velocity(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s, X_t, Y_t, Z_t):
     """
     Вычисляет угол между вектором на цель и направлением скорости спутника
@@ -234,9 +318,10 @@ def move_point_by_distance_azimuth(lon, lat, distance_km, azimuth_deg):
     
     return new_lon, new_lat
 
-def create_oriented_square_20km(center_lon, center_lat, track_azimuth):
+def create_oriented_square_10km(center_lon, center_lat, track_azimuth):
     """
-    Создать квадратную рамку 20x20 км, ориентированную вдоль трассы КА
+    Создать квадратную рамку 10x10 км для детального прожекторного режима (ДПР),
+    ориентированную вдоль трассы КА согласно руководству пользователя Кондор-ФКА
     
     Аргументы:
         center_lon: долгота центра квадрата (градусы)
@@ -244,10 +329,10 @@ def create_oriented_square_20km(center_lon, center_lat, track_azimuth):
         track_azimuth: азимут трассы КА (градусы)
     
     Возвращает:
-        Polygon: квадрат 20x20 км, одна сторона параллельна направлению движения КА
+        Polygon: квадрат 10x10 км, одна сторона параллельна направлению движения КА
     """
-    # Размер квадрата: 20 км
-    half_size_km = 10.0  # Половина размера квадрата
+    # Размер квадрата: 10 км (согласно руководству пользователя Кондор-ФКА для детального прожекторного режима)
+    half_size_km = 5.0  # Половина размера квадрата (10 км / 2 = 5 км)
     
     # Расстояние от центра до угла (диагональ квадрата)
     diagonal_km = half_size_km * np.sqrt(2)
@@ -457,6 +542,15 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 current_time += timedelta(seconds=point_step_seconds)
                 continue
             
+            # Вычисляем доплеровскую частоту согласно статье Зайцева В.В.
+            # Используем длину волны X-диапазона (0.031 м) по умолчанию
+            # Для других диапазонов: C-диапазон ~0.055 м, L-диапазон ~0.24 м
+            doppler_freq = calculate_doppler_frequency(
+                X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s,
+                pos_tgt_eci[0], pos_tgt_eci[1], pos_tgt_eci[2],
+                wavelength=0.031  # X-диапазон (можно сделать параметром)
+            )
+            
             # Создаем точку местоположения КА с высокой точностью
             sat_point = Point(lon_sat, lat_sat)
             geometries.append(sat_point)
@@ -474,6 +568,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 'angle_traverse': round(angle, 6),  # Угол между КА и объектом относительно траверса (88-92°)
                 'distance': round(distance, 2),
                 'max_dist': round(max_distance, 2),
+                'doppler_freq': round(doppler_freq, 3),  # Доплеровская частота в Гц
                 'visible': 1 if is_visible else 0
             }
             attributes.append(attrs)
@@ -543,7 +638,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 # Создаем новый файл
                 new_gdf.to_file(output_file, driver='GPKG', layer='periods_points')
         
-        # Создаем и сохраняем квадратную рамку 20x20 км для периода
+        # Создаем и сохраняем квадратную рамку 10x10 км для детального прожекторного режима (ДПР)
         try:
             # Вычисляем среднее время периода для расчета азимута трассы
             mid_time = period_start + (period_end - period_start) / 2
@@ -554,19 +649,30 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             # Получаем координаты целевой точки
             lat_t, lon_t, alt_t = target_pos
             
-            # Создаем квадрат 20x20 км, ориентированный вдоль трассы КА
-            square_polygon = create_oriented_square_20km(lon_t, lat_t, track_azimuth)
+            # Создаем квадрат 10x10 км для детального прожекторного режима, ориентированный вдоль трассы КА
+            square_polygon = create_oriented_square_10km(lon_t, lat_t, track_azimuth)
+            
+            # Расчет количества снимков в детальном прожекторном режиме (ДПР) для квадратной рамки
+            period_duration_seconds = (period_end - period_start).total_seconds()
+            images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+                period_duration_seconds,
+                image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+                antenna_switch_time=2.0       # Время переключения антенны (сек)
+            )
             
             # Создаем GeoDataFrame для квадрата
             square_attrs = {
                 'period_id': period_id,
                 'type': 'square_frame',
-                'size_km': 20.0,
+                'size_km': 10.0,  # Размер кадра в детальном прожекторном режиме согласно руководству Кондор-ФКА
                 'center_lon': round(lon_t, 9),
                 'center_lat': round(lat_t, 9),
                 'track_azimuth': round(track_azimuth, 6),
                 'start_time': period_start.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                'end_time': period_end.strftime('%Y-%m-%d %H:%M:%S.%f')
+                'end_time': period_end.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                'spotlight_images_count': images_count,  # Количество снимков в ДПР
+                'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки в ДПР (сек)
+                'spotlight_residual_time': round(residual_time, 1)  # Остаточное время периода после съемки (сек)
             }
             square_gdf = gpd.GeoDataFrame([square_attrs], geometry=[square_polygon], crs='EPSG:4326')
             
@@ -710,12 +816,22 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
                     mid_time = period_start + (period_end - period_start) / 2
                     avg_angle = calculate_angle_from_velocity_at_time(mid_time, orb, target_pos)
                     
+                    # Расчет количества снимков в детальном прожекторном режиме (ДПР)
+                    images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+                        period_duration,
+                        image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+                        antenna_switch_time=2.0       # Время переключения антенны (сек)
+                    )
+                    
                     period_data = {
                         'angle': round(avg_angle, 1),  # Округляем до 0.1 градуса
                         'start_time': period_start,
                         'end_time': period_end,
                         'calculated_angle': avg_angle,
-                        'period_duration': period_duration
+                        'period_duration': period_duration,
+                        'spotlight_images_count': images_count,  # Количество снимков в ДПР
+                        'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки
+                        'spotlight_residual_time': round(residual_time, 1)  # Остаточное время
                     }
                     sequence.append(period_data)
                     
@@ -744,12 +860,22 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
             mid_time = period_start + (period_end - period_start) / 2
             avg_angle = calculate_angle_from_velocity_at_time(mid_time, orb, target_pos)
             
+            # Расчет количества снимков в детальном прожекторном режиме (ДПР)
+            images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+                period_duration,
+                image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+                antenna_switch_time=2.0       # Время переключения антенны (сек)
+            )
+            
             period_data = {
                 'angle': round(avg_angle, 1),
                 'start_time': period_start,
                 'end_time': period_end,
                 'calculated_angle': avg_angle,
-                'period_duration': period_duration
+                'period_duration': period_duration,
+                'spotlight_images_count': images_count,  # Количество снимков в ДПР
+                'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки
+                'spotlight_residual_time': round(residual_time, 1)  # Остаточное время
             }
             sequence.append(period_data)
             
@@ -836,6 +962,22 @@ def continuous_angle_sequence():
     for i, item in enumerate(sequence, 1):
         print(f"\n{i}. Период: {item['start_time'].strftime('%Y-%m-%d %H:%M:%S')} - {item['end_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"   Длительность: {item['period_duration']:.3f} сек ({item['period_duration']/60:.2f} мин)")
+        
+        # Расчет количества снимков в детальном прожекторном режиме (ДПР) согласно руководству Кондор-ФКА
+        # Параметры для S-диапазона Кондор-ФКА:
+        # - Время синтеза апертуры для одного кадра: ~10 секунд
+        # - Время переключения антенны между кадрами: ~2 секунды
+        images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+            item['period_duration'],
+            image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+            antenna_switch_time=2.0       # Время переключения антенны (сек)
+        )
+        print(f"   Детальный прожекторный режим (ДПР):")
+        print(f"     - Количество снимков: {images_count}")
+        if images_count > 0:
+            print(f"     - Общее время съемки: {total_cycle_time:.1f} сек")
+            if residual_time > 0:
+                print(f"     - Остаточное время: {residual_time:.1f} сек")
         
         # Получаем координаты КА в начале и конце периода
         try:
