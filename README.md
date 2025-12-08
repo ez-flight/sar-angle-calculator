@@ -86,11 +86,11 @@ This paper presents a methodology and software implementation for calculating th
 $$\mathbf{R}_{target} = \mathbf{R}_t - \mathbf{R}_s$$
 
 Нормализованные векторы:
-$$\mathbf{V}_{s,unit} = \frac{\mathbf{V}_s}{|\mathbf{V}_s|}$$
-$$\mathbf{R}_{target,unit} = \frac{\mathbf{R}_{target}}{|\mathbf{R}_{target}|}$$
+$$\mathbf{V}_{s,\text{unit}} = \frac{\mathbf{V}_s}{|\mathbf{V}_s|}$$
+$$\mathbf{R}_{\text{target},\text{unit}} = \frac{\mathbf{R}_{\text{target}}}{|\mathbf{R}_{\text{target}}|}$$
 
 Проекция вектора на цель на направление скорости:
-$$projection = \mathbf{R}_{target,unit} \cdot \mathbf{V}_{s,unit}$$
+$$projection = \mathbf{R}_{\text{target},\text{unit}} \cdot \mathbf{V}_{s,\text{unit}}$$
 
 Угол между вектором на цель и направлением скорости:
 $$\theta = \arccos(projection)$$
@@ -306,9 +306,9 @@ $$azimuth_{deg} = ((azimuth_{rad} \cdot \frac{180}{\pi}) + 360) \bmod 360$$
 $$|\mathbf{V}_s| = \sqrt{V_{x_s}^2 + V_{y_s}^2 + V_{z_s}^2}$$
 
 Средняя орбитальная скорость для промежутка между периодами:
-$$V_{avg} = \frac{|\mathbf{V}_{s,end}| + |\mathbf{V}_{s,start}|}{2}$$
+$$V_{avg} = \frac{|\mathbf{V}_{s,\text{end}}| + |\mathbf{V}_{s,\text{start}}|}{2}$$
 
-где $\mathbf{V}_{s,end}$ и $\mathbf{V}_{s,start}$ - скорости космического аппарата в конце одного периода и начале следующего.
+где $\mathbf{V}_{s,\text{end}}$ и $\mathbf{V}_{s,\text{start}}$ - скорости космического аппарата в конце одного периода и начале следующего.
 
 Пройденное расстояние за промежуток времени $\Delta t$:
 $$d = V_{avg} \cdot \Delta t$$
@@ -527,7 +527,7 @@ $$d_{diagonal} = \frac{size}{\sqrt{2}} = \frac{10}{\sqrt{2}} \approx 7.07 \text{
 В отличие от работ [1-3], которые фокусируются на оптимизации расписаний для оптических систем, разработанная методология специально учитывает специфические угловые ограничения РСА-систем. Ключевое отличие заключается в использовании полного диапазона углов (0-180°) относительно направления скорости, а не упрощенной модели с ограничением диапазона 0-90°. Это позволяет более точно определять оптимальные периоды наблюдения, особенно для случаев, когда объект находится сзади по направлению движения космического аппарата.
 
 Формула расчета угла без использования абсолютного значения проекции:
-$$\theta = \arccos(\mathbf{R}_{target,unit} \cdot \mathbf{V}_{s,unit})$$
+$$\theta = \arccos(\mathbf{R}_{\text{target},\text{unit}} \cdot \mathbf{V}_{s,\text{unit}})$$
 
 где проекция может принимать значения от -1 до +1, что обеспечивает полный диапазон углов 0-180°.
 
