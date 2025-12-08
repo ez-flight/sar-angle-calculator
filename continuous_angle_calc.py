@@ -570,31 +570,31 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             )
             
             # Определяем, какому снимку соответствует эта точка
-            # Вычисляем время от начала периода в секундах
-            time_from_start = (current_time - period_start).total_seconds()
+            # Явное присвоение номера снимка на основе временных интервалов
             image_number = None
             
-            # Проверяем, попадает ли точка во время какого-либо снимка
-            # Снимки идут последовательно:
-            # - Снимок 1: от 0.0 до 10.0 сек
-            # - Переключение: от 10.0 до 12.0 сек (не сохраняем)
-            # - Снимок 2: от 12.0 до 22.0 сек
-            # - Переключение: от 22.0 до 24.0 сек (не сохраняем)
-            # - И так далее...
-            
-            if images_count > 0 and time_from_start >= 0.0:
-                # Проверяем каждый возможный снимок
+            if images_count > 0:
+                # Проверяем каждый снимок в порядке от первого к последнему
+                # Используем ту же логику вычисления временных интервалов, что и при выводе
                 for img_num in range(1, images_count + 1):
-                    # Время начала снимка (секунды от начала периода)
-                    image_start_time = (img_num - 1) * cycle_time
-                    # Время окончания снимка (начало + время съемки)
-                    image_end_time = image_start_time + image_acquisition_time
+                    # Вычисляем время начала снимка абсолютное (datetime)
+                    # Снимок 1 начинается в period_start
+                    # Снимок 2 начинается через cycle_time после начала периода
+                    # Снимок N начинается через (N-1) * cycle_time после начала периода
+                    image_start_datetime = period_start + timedelta(seconds=(img_num - 1) * cycle_time)
                     
-                    # Проверяем, попадает ли точка во время этого снимка
-                    if image_start_time <= time_from_start < image_end_time:
+                    # Время окончания снимка (начало + время съемки)
+                    image_end_datetime = image_start_datetime + timedelta(seconds=image_acquisition_time)
+                    
+                    # Явная проверка: попадает ли текущая точка во временной интервал этого снимка
+                    # Интервал снимка: [image_start_datetime, image_end_datetime)
+                    # Включаем момент начала, НЕ включаем момент окончания (момент окончания - это начало переключения)
+                    if image_start_datetime <= current_time < image_end_datetime:
                         image_number = img_num
-                        break
-                # Если точка не попала ни в один снимок (время переключения), image_number остается None
+                        break  # Найден соответствующий снимок, прекращаем поиск
+                
+                # Если image_number остался None, значит точка попадает в интервал переключения антенны
+                # Такие точки не сохраняются (фильтруются позже)
             
             # Создаем точку местоположения КА с высокой точностью
             sat_point = Point(lon_sat, lat_sat)
@@ -705,9 +705,10 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 new_gdf.to_file(output_file, driver='GPKG', layer='periods_points')
         
         # Создаем и сохраняем квадратные рамки 10x10 км для каждого снимка в детальном прожекторном режиме (ДПР)
+        # Получаем координаты целевой точки (нужны для создания квадратов)
+        lat_t, lon_t, alt_t = target_pos
+        
         try:
-            # Получаем координаты целевой точки
-            lat_t, lon_t, alt_t = target_pos
             
             # Расчет количества снимков в детальном прожекторном режиме (ДПР)
             period_duration_seconds = (period_end - period_start).total_seconds()
@@ -730,7 +731,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 # Время окончания снимка (начало + время синтеза апертуры)
                 image_end_time = image_start_time + timedelta(seconds=10.0)
                 
-                # Вычисляем азимут трассы КА в момент начала снимка
+                # Вычисляем азимут трассы КА в момент начала снимка (нужен для квадрата)
                 track_azimuth = calculate_track_azimuth(orb, image_start_time)
                 
                 # Создаем квадрат 10x10 км для детального прожекторного режима, ориентированный вдоль трассы КА
@@ -1133,7 +1134,7 @@ def continuous_angle_sequence():
     start_date = datetime(2024, 3, 22, 0, 0, 0)
     
     # Количество суток для расчета
-    num_days = 16
+    num_days = 1
     
     # Параметры фильтрации по R0 (наклонная дальность)
     R0_min = 561  # Минимальное расстояние R0 в км
@@ -1197,6 +1198,91 @@ def continuous_angle_sequence():
             print(f"     - Общее время съемки: {total_cycle_time:.1f} сек")
             if residual_time > 0:
                 print(f"     - Остаточное время: {residual_time:.1f} сек")
+            
+            # Выводим время начала и конца для каждого снимка
+            image_acquisition_time = 10.0
+            antenna_switch_time = 2.0
+            cycle_time = image_acquisition_time + antenna_switch_time
+            
+            # Подсчитываем количество точек и сохраняем время точек для каждого снимка из GPKG файла
+            points_count_by_image = {}
+            points_times_by_image = {}  # Словарь для хранения времени всех точек каждого снимка
+            gpkg_file = 'result/periods_points.gpkg'
+            period_id = i  # period_id соответствует порядковому номеру периода в sequence
+            
+            try:
+                if os.path.exists(gpkg_file):
+                    gdf_points = gpd.read_file(gpkg_file, layer='periods_points')
+                    # Фильтруем точки текущего периода
+                    if 'period_id' in gdf_points.columns and 'image_number' in gdf_points.columns and 'time' in gdf_points.columns:
+                        period_points = gdf_points[gdf_points['period_id'] == period_id]
+                        # Подсчитываем количество точек и сохраняем время для каждого снимка
+                        for img_num in range(1, images_count + 1):
+                            image_points = period_points[period_points['image_number'] == img_num]
+                            points_count_by_image[img_num] = len(image_points)
+                            # Сохраняем время всех точек для этого снимка
+                            if len(image_points) > 0:
+                                # Извлекаем время точек и сортируем
+                                times = image_points['time'].tolist()
+                                points_times_by_image[img_num] = sorted(times)
+                            else:
+                                points_times_by_image[img_num] = []
+            except Exception as e:
+                # Если не удалось прочитать файл, просто не будем выводить количество точек
+                pass
+            
+            print(f"     - Время снимков:")
+            for image_num in range(1, images_count + 1):
+                image_start_time = item['start_time'] + timedelta(seconds=(image_num - 1) * cycle_time)
+                image_end_time = image_start_time + timedelta(seconds=image_acquisition_time)
+                points_count = points_count_by_image.get(image_num, 0)
+                print(f"       Снимок {image_num}: {image_start_time.strftime('%Y-%m-%d %H:%M:%S')} - {image_end_time.strftime('%Y-%m-%d %H:%M:%S')} ({points_count} точек)")
+                
+                # Диагностика: проверяем, почему точки могут обрываться
+                period_end_time = item['end_time']
+                if image_end_time > period_end_time:
+                    # Время окончания снимка выходит за пределы периода
+                    print(f"         ⚠️  Примечание: время окончания снимка ({image_end_time.strftime('%Y-%m-%d %H:%M:%S')}) выходит за пределы периода наблюдения ({period_end_time.strftime('%Y-%m-%d %H:%M:%S')})")
+                    print(f"         ⚠️  Период заканчивается раньше, чем заканчивается снимок (вероятно, угол вышел за пределы 88-92°)")
+                
+                # Выводим время всех точек для этого снимка
+                if image_num in points_times_by_image and len(points_times_by_image[image_num]) > 0:
+                    print(f"         Время точек:")
+                    for point_time_str in points_times_by_image[image_num]:
+                        # Выводим время точки (формат: YYYY-MM-DD HH:MM:SS.microseconds)
+                        # Пытаемся распарсить с микросекундами
+                        try:
+                            # Пробуем формат с микросекундами
+                            point_time = datetime.strptime(point_time_str, '%Y-%m-%d %H:%M:%S.%f')
+                            print(f"           {point_time.strftime('%Y-%m-%d %H:%M:%S.%f')}")
+                        except:
+                            try:
+                                # Пробуем формат без микросекунд
+                                point_time = datetime.strptime(point_time_str, '%Y-%m-%d %H:%M:%S')
+                                print(f"           {point_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                            except:
+                                # Если не удалось распарсить, выводим как есть
+                                print(f"           {point_time_str}")
+                    
+                    # Диагностика: показываем, когда закончились точки относительно времени окончания снимка
+                    if len(points_times_by_image[image_num]) > 0:
+                        try:
+                            last_point_time_str = points_times_by_image[image_num][-1]
+                            last_point_time = datetime.strptime(last_point_time_str, '%Y-%m-%d %H:%M:%S.%f')
+                        except:
+                            try:
+                                last_point_time = datetime.strptime(last_point_time_str, '%Y-%m-%d %H:%M:%S')
+                            except:
+                                last_point_time = None
+                        
+                        if last_point_time:
+                            time_diff = (image_end_time - last_point_time).total_seconds()
+                            if time_diff > 0.2:  # Если разница больше шага точек (0.1 сек), выводим предупреждение
+                                print(f"         ⚠️  Последняя точка ({last_point_time.strftime('%Y-%m-%d %H:%M:%S.%f')}) на {time_diff:.1f} сек раньше времени окончания снимка")
+                                print(f"         ⚠️  Возможные причины: угол вышел за пределы 88-92°, период наблюдения закончился, или точка не прошла фильтры")
+                else:
+                    # Если нет точек для этого снимка
+                    print(f"         ⚠️  Нет точек для этого снимка (возможно, все точки были отфильтрованы или период закончился до начала снимка)")
         
         # Получаем координаты КА в начале и конце периода
         try:
@@ -1292,6 +1378,44 @@ def continuous_angle_sequence():
     
     # Экспорт атрибутов GPKG в текстовый файл для анализа
     export_gpkg_attributes_to_txt()
+    
+    # Проверка угла для указанного времени
+    check_time = datetime(2024, 3, 22, 3, 58, 37)
+    try:
+        angle_at_time = calculate_angle_from_velocity_at_time(check_time, orb, target_pos)
+        print("\n" + "=" * 80)
+        print(f"ПРОВЕРКА УГЛА ДЛЯ УКАЗАННОГО ВРЕМЕНИ")
+        print("=" * 80)
+        print(f"Время: {check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Угол между вектором на цель и направлением скорости: {angle_at_time:.6f}°")
+        
+        # Проверяем, попадает ли угол в допустимый диапазон
+        if 88.0 <= angle_at_time <= 92.0:
+            print(f"✓ Угол находится в допустимом диапазоне (88-92°)")
+        else:
+            print(f"✗ Угол НЕ в допустимом диапазоне (88-92°)")
+        
+        # Дополнительная информация
+        try:
+            X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, check_time)
+            lat_t, lon_t, alt_t = target_pos
+            pos_tgt_eci, _ = get_xyzv_from_latlon(check_time, lon_t, lat_t, alt_t)
+            target_pos_eci = pos_tgt_eci
+            sat_pos_eci = (X_s, Y_s, Z_s)
+            is_visible, distance, max_distance = is_target_visible(sat_pos_eci, target_pos_eci, check_time)
+            
+            print(f"Видимость цели: {'Да' if is_visible else 'Нет'}")
+            print(f"Наклонная дальность: {distance:.2f} км")
+            if R0_min and R0_max:
+                if R0_min <= distance <= R0_max:
+                    print(f"✓ Наклонная дальность в допустимом диапазоне ({R0_min}-{R0_max} км)")
+                else:
+                    print(f"✗ Наклонная дальность НЕ в допустимом диапазоне ({R0_min}-{R0_max} км)")
+        except Exception as e:
+            print(f"Не удалось вычислить дополнительные параметры: {e}")
+            
+    except Exception as e:
+        print(f"\n⚠️  Не удалось вычислить угол для времени {check_time.strftime('%Y-%m-%d %H:%M:%S')}: {e}")
     
     print("=" * 80)
 
