@@ -13,15 +13,35 @@ import os
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point, Polygon
+from staring_spotlight_calc import (
+    analyze_periods_for_staring_spotlight,
+    print_staring_spotlight_analysis
+)
+
+# Глобальные константы для диапазона углов
+ANGLE_MIN = 85.9  # Минимальный угол (градусы)
+ANGLE_MAX = 94.1  # Максимальный угол (градусы)
 
 def get_position(orb: Orbital, utc_time: datetime) -> tuple:
     """Вычисляет положение и скорость спутника"""
     R_s, V_s = orb.get_position(utc_time, False)
     return (*R_s, *V_s)
 
-def calculate_angle_from_velocity_at_time(target_time, orb, target_pos):
-    """Рассчитать угол между вектором на цель и направлением скорости в заданный момент времени"""
-    X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, target_time)
+def calculate_angle_from_velocity_at_time(target_time, orb, target_pos, sat_pos_vel=None):
+    """
+    Рассчитать угол между вектором на цель и направлением скорости в заданный момент времени
+    
+    Аргументы:
+        target_time: datetime - момент времени
+        orb: объект Orbital
+        target_pos: кортеж (широта, долгота, высота) целевой точки
+        sat_pos_vel: опционально, кортеж (X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s) для избежания повторного вызова get_position
+    """
+    if sat_pos_vel is None:
+        X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, target_time)
+    else:
+        X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = sat_pos_vel
+    
     lat_t, lon_t, alt_t = target_pos
     pos_it, _ = get_xyzv_from_latlon(target_time, lon_t, lat_t, alt_t)
     X_t, Y_t, Z_t = pos_it
@@ -132,7 +152,7 @@ def calculate_angle_from_velocity(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s, X_t, Y_t, Z_t
     - 90° = цель перпендикулярно скорости (траверзная плоскость)
     - 180° = цель против направления скорости (сзади)
     
-    В диапазоне 88-92° цель находится почти перпендикулярно скорости.
+    В диапазоне 85.9-94.1° (определяется константами ANGLE_MIN и ANGLE_MAX) цель находится почти перпендикулярно скорости.
     
     Возвращает угол в градусах (0-180°)
     """
@@ -506,16 +526,21 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
     attributes = []
     
     # Параметры фильтрации по углу
-    angle_min = 88.0  # Минимальный угол (градусы)
-    angle_max = 92.0  # Максимальный угол (градусы)
+    angle_min = ANGLE_MIN
+    angle_max = ANGLE_MAX
     
     current_time = period_start
     point_count = 0
     filtered_by_angle_count = 0  # Счетчик отфильтрованных точек
     valid_points_count = 0  # Счетчик валидных точек
     
-    # Генерируем точки до тех пор, пока не наберем минимум валидных точек или не закончится период
-    while current_time <= period_end:
+    # Генерируем точки до тех пор, пока угол не превысит максимум
+    # Продолжаем сканирование до тех пор, пока угол не превысит ANGLE_MAX (94.1°)
+    # Не ограничиваемся period_end, а сканируем до достижения максимального угла
+    max_angle_reached = False
+    extended_end_time = period_end + timedelta(seconds=60.0)  # Даем запас в 60 секунд для достижения максимального угла
+    
+    while current_time <= extended_end_time and not max_angle_reached:
         try:
             # Получаем координаты спутника в ECI для расчета расстояния и более точного преобразования
             # Важно: получаем координаты для ТОЧНОГО момента времени current_time
@@ -540,8 +565,14 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 current_time += timedelta(seconds=point_step_seconds)
                 continue
             
-            # Фильтруем точки по диапазону угла (88-92°)
-            if angle < angle_min or angle > angle_max:
+            # Проверяем угол - если он превысил максимум, прекращаем сканирование
+            # Это должно быть ПЕРВОЙ проверкой, чтобы мы точно включили все точки до 94.1°
+            if angle > angle_max:
+                max_angle_reached = True
+                break
+            
+            # Фильтруем точки по диапазону угла (меньше минимума)
+            if angle < angle_min:
                 filtered_by_angle_count += 1
                 current_time += timedelta(seconds=point_step_seconds)
                 continue
@@ -555,6 +586,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             is_visible, distance, max_distance = is_target_visible(sat_pos_eci, target_pos_eci, current_time)
             
             # Дополнительная проверка угла перед сохранением (на всякий случай)
+            # Угол должен быть в диапазоне [angle_min, angle_max]
             if angle < angle_min or angle > angle_max:
                 filtered_by_angle_count += 1
                 current_time += timedelta(seconds=point_step_seconds)
@@ -611,7 +643,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 'sat_lon': round(lon_sat, 9),  # Увеличена точность до 9 знаков после запятой
                 'sat_lat': round(lat_sat, 9),  # Увеличена точность до 9 знаков после запятой
                 'sat_alt': round(alt, 6),  # Увеличена точность высоты
-                'angle_traverse': round(angle, 6),  # Угол между КА и объектом относительно траверса (88-92°)
+                'angle_traverse': round(angle, 6),  # Угол между КА и объектом относительно траверса
                 'distance': round(distance, 2),
                 'max_dist': round(max_distance, 2),
                 'doppler_freq': round(doppler_freq, 3)  # Доплеровская частота в Гц
@@ -638,7 +670,7 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
             angle_val = attr.get('angle_traverse')
             image_number_val = attr.get('image_number')
             
-            # Проверяем, что угол валиден и в диапазоне 88-92
+            # Проверяем, что угол валиден и в допустимом диапазоне
             angle_valid = angle_val is not None and not (isinstance(angle_val, float) and (np.isnan(angle_val) or np.isinf(angle_val)))
             angle_in_range = angle_valid and (angle_min <= angle_val <= angle_max)
             
@@ -819,33 +851,41 @@ def save_period_points_to_gpkg(period_start, period_end, period_id, orb, target_
                 if image_stats_str:
                     print(f"    Распределение по снимкам: {image_stats_str}")
 
-def find_exact_period_start(approx_start_time, orb, target_pos, time_step_seconds=1.0):
+def scan_period_detailed(approx_start_time, orb, target_pos, R0_min=None, R0_max=None, time_step_seconds=0.1, look_back_seconds=10.0):
     """
-    Точный поиск начала периода с шагом 1 секунда
-    Возвращается назад на 10 секунд от приблизительного начала и ищет точное начало
+    Детальное сканирование периода с шагом 0.1 секунды, начиная с 10 секунд назад
     
     Аргументы:
         approx_start_time: datetime - приблизительное время начала периода (обнаружено с шагом 10 сек)
         orb: объект Orbital
         target_pos: кортеж (широта, долгота, высота) целевой точки
-        time_step_seconds: шаг времени для точного поиска (секунды), по умолчанию 1.0
+        R0_min: минимальное расстояние R0 (наклонная дальность) в км, None = без ограничения
+        R0_max: максимальное расстояние R0 (наклонная дальность) в км, None = без ограничения
+        time_step_seconds: шаг времени для детального сканирования (секунды), по умолчанию 0.1
+        look_back_seconds: на сколько секунд назад отступать (секунды), по умолчанию 10.0
     
     Возвращает:
-        datetime - точное время начала периода
+        кортеж (period_start, period_end) - точное начало и конец периода, или (None, None) если период не найден
     """
-    # Отступаем на 10 секунд назад от приблизительного начала
-    search_start = approx_start_time - timedelta(seconds=10.0)
+    # Отступаем на look_back_seconds секунд назад от приблизительного начала
+    search_start = approx_start_time - timedelta(seconds=look_back_seconds)
     current_time = search_start
     
-    angle_min = 88.0
-    angle_max = 92.0
+    angle_min = ANGLE_MIN
+    angle_max = ANGLE_MAX
     period_start = None
+    period_end = None
+    in_period = False
     
-    # Ищем точное начало периода с шагом 1 секунда
-    while current_time <= approx_start_time:
+    # Сканируем вперед, пока не найдем конец периода или не пройдем достаточно далеко
+    # Ограничиваем сканирование разумным пределом (например, 5 минут вперед для учета полного диапазона углов)
+    max_scan_duration = 300.0  # Максимальная длительность сканирования вперед (5 минут)
+    scan_end_time = approx_start_time + timedelta(seconds=max_scan_duration)
+    
+    while current_time <= scan_end_time:
         try:
             # Получаем координаты спутника и цели в ECI
-            X_s, Y_s, Z_s, _, _, _ = get_position(orb, current_time)
+            X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, current_time)
             sat_pos_eci = (X_s, Y_s, Z_s)
             
             lat_t, lon_t, alt_t = target_pos
@@ -855,28 +895,88 @@ def find_exact_period_start(approx_start_time, orb, target_pos, time_step_second
             # Проверяем видимость
             is_visible, distance, max_distance = is_target_visible(sat_pos_eci, target_pos_eci, current_time)
             
+            # R0 - это distance (наклонная дальность от спутника до цели)
+            R0 = distance
+            
+            # Фильтруем точки по диапазону R0 (если заданы ограничения)
+            if is_visible:
+                if R0_min is not None and R0 < R0_min:
+                    is_visible = False
+                elif R0_max is not None and R0 > R0_max:
+                    is_visible = False
+            
             if is_visible:
                 # Вычисляем угол между вектором на цель и направлением скорости
-                angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos)
+                # Передаем уже вычисленные координаты спутника для избежания повторного вызова get_position
+                angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos, sat_pos_vel=(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s))
                 
                 # Проверяем, что угол валиден
                 if angle is not None and not (isinstance(angle, float) and (np.isnan(angle) or np.isinf(angle))):
-                    if angle_min <= angle <= angle_max:
-                        if period_start is None:
-                            # Нашли начало периода
+                    angle_in_range = (angle_min <= angle <= angle_max)
+                    
+                    if angle_in_range:
+                        # Угол в допустимом диапазоне - период активен
+                        if not in_period:
+                            # Начало периода
                             period_start = current_time
+                            in_period = True
+                        # Продолжение периода - обновляем конец
+                        period_end = current_time
                     else:
-                        # Если угол вышел за пределы, но период уже начался - это конец поиска
-                        if period_start is not None:
+                        # Угол вне допустимого диапазона
+                        if in_period:
+                            # Проверяем, превысил ли угол максимальное значение
+                            # Если угол больше максимального, период заканчивается
+                            if angle > angle_max:
+                                # Угол превысил максимум - период заканчивается
+                                # Но включаем эту точку в период, так как она последняя в диапазоне
+                                period_end = current_time
+                                break
+                            elif angle < angle_min:
+                                # Угол меньше минимума - период заканчивается
+                                break
+            else:
+                # Объект не виден
+                if in_period:
+                    # Если объект стал невидимым, продолжаем сканирование еще немного,
+                    # чтобы найти момент, когда угол превысит максимум
+                    # Это важно, так как период должен заканчиваться по углу, а не по видимости
+                    # Продолжаем до тех пор, пока не найдем момент превышения максимума или не пройдет слишком много времени
+                    if period_end is not None:
+                        time_since_last_visible = (current_time - period_end).total_seconds()
+                        # Продолжаем сканирование до 15 секунд после потери видимости, чтобы найти момент превышения максимума
+                        if time_since_last_visible > 15.0:
                             break
+                        # Вычисляем угол даже если объект не виден, чтобы определить момент превышения максимума
+                        try:
+                            angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos, sat_pos_vel=(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s))
+                            if angle is not None and not (isinstance(angle, float) and (np.isnan(angle) or np.isinf(angle))):
+                                if angle > angle_max:
+                                    # Угол превысил максимум - период заканчивается
+                                    period_end = current_time
+                                    break
+                        except:
+                            pass
+                    else:
+                        # Если период еще не начался, просто прекращаем
+                        break
         except Exception:
             # Пропускаем точку при ошибке
-            pass
+            if in_period:
+                # Если была ошибка во время периода, все равно продолжаем
+                pass
         
         current_time += timedelta(seconds=time_step_seconds)
     
-    # Если не нашли точное начало, возвращаем приблизительное
-    return period_start if period_start is not None else approx_start_time
+    # Если период найден, возвращаем его границы
+    if period_start is not None and period_end is not None:
+        period_duration = (period_end - period_start).total_seconds()
+        return period_start, period_end
+    else:
+        # Отладочная информация, если период не найден
+        # (можно закомментировать после отладки)
+        # print(f"    Отладка scan_period_detailed: период не найден для времени {approx_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        return None, None
 
 def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=1.0, min_period_duration=30.0, R0_min=None, R0_max=None, num_days=1):
     """
@@ -917,14 +1017,14 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
     
     # Параметры фильтрации по углу между вектором на цель и направлением скорости
     # Угол измеряется от направления скорости: 0° = вдоль скорости, 90° = перпендикулярно
-    angle_min = 88.0  # Минимальный угол (градусы)
-    angle_max = 92.0  # Максимальный угол (градусы)
+    angle_min = ANGLE_MIN
+    angle_max = ANGLE_MAX
     
     while current_time < end_date:
         checked_count += 1
         
         # Получаем координаты спутника и цели в ECI
-        X_s, Y_s, Z_s, _, _, _ = get_position(orb, current_time)
+        X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s = get_position(orb, current_time)
         sat_pos_eci = (X_s, Y_s, Z_s)
         
         lat_t, lon_t, alt_t = target_pos
@@ -948,25 +1048,92 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
         
         if is_visible:
             # Вычисляем угол между вектором на цель и направлением скорости
-            angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos)
+            # Передаем уже вычисленные координаты спутника для избежания повторного вызова get_position
+            angle = calculate_angle_from_velocity_at_time(current_time, orb, target_pos, sat_pos_vel=(X_s, Y_s, Z_s, Vx_s, Vy_s, Vz_s))
             
-            # Фильтруем точки по диапазону угла (88-92°)
-            if angle < angle_min or angle > angle_max:
-                filtered_by_angle_count += 1
-                current_time += timedelta(seconds=time_step_seconds)
-                continue
+            # Проверяем, находится ли угол в допустимом диапазоне
+            angle_in_range = (angle_min <= angle <= angle_max)
             
-            visible_count += 1
-            
-            if period_start is None:
-                # Начало нового периода - делаем точный поиск начала с шагом 1 секунда
-                period_start = find_exact_period_start(current_time, orb, target_pos, time_step_seconds=1.0)
-                period_angle = angle
+            if angle_in_range:
+                # Угол в допустимом диапазоне - начинаем или продолжаем период
+                visible_count += 1
+                
+                if period_start is None:
+                    # Начало нового периода - делаем детальное сканирование с шагом 0.1 секунды
+                    # Отступаем на 10 секунд назад и сканируем с частотой 0.1 сек
+                    detailed_start, detailed_end = scan_period_detailed(
+                        current_time, 
+                        orb, 
+                        target_pos, 
+                        R0_min=R0_min, 
+                        R0_max=R0_max, 
+                        time_step_seconds=0.1, 
+                        look_back_seconds=10.0
+                    )
+                    
+                    if detailed_start is not None and detailed_end is not None:
+                        # Период найден при детальном сканировании
+                        period_start = detailed_start
+                        period_end = detailed_end
+                        period_duration = (period_end - period_start).total_seconds()
+                        
+                        # Отладочная информация
+                        if period_duration < min_period_duration:
+                            print(f"  Отладочная информация: найден период длительностью {period_duration:.1f} сек (минимум {min_period_duration} сек)")
+                            print(f"    Начало: {period_start.strftime('%Y-%m-%d %H:%M:%S')}, Конец: {period_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                        
+                        if period_duration >= min_period_duration:
+                            # Вычисляем средний угол для периода
+                            mid_time = period_start + (period_end - period_start) / 2
+                            avg_angle = calculate_angle_from_velocity_at_time(mid_time, orb, target_pos)
+                            
+                            # Расчет количества снимков в детальном прожекторном режиме (ДПР)
+                            images_count, total_cycle_time, residual_time = calculate_spotlight_images_count(
+                                period_duration,
+                                image_acquisition_time=10.0,  # Время синтеза апертуры для одного кадра (сек)
+                                antenna_switch_time=2.0       # Время переключения антенны (сек)
+                            )
+                            
+                            period_data = {
+                                'angle': round(avg_angle, 1),  # Округляем до 0.1 градуса
+                                'start_time': period_start,
+                                'end_time': period_end,
+                                'calculated_angle': avg_angle,
+                                'period_duration': period_duration,
+                                'spotlight_images_count': images_count,  # Количество снимков в ДПР
+                                'spotlight_total_time': round(total_cycle_time, 1),  # Общее время съемки
+                                'spotlight_residual_time': round(residual_time, 1)  # Остаточное время
+                            }
+                            sequence.append(period_data)
+                            
+                            # Сохраняем все точки периода в GPKG
+                            try:
+                                save_period_points_to_gpkg(period_start, period_end, len(sequence), orb, target_pos)
+                            except Exception as e:
+                                print(f"  Предупреждение: не удалось сохранить точки периода {len(sequence)} в GPKG: {e}")
+                        
+                        # Сбрасываем период, чтобы искать следующий
+                        period_start = None
+                        period_end = None
+                        
+                        # Переходим к времени после конца найденного периода
+                        current_time = detailed_end + timedelta(seconds=time_step_seconds)
+                        continue
+                    else:
+                        # Детальное сканирование не нашло период или период слишком короткий
+                        # Продолжаем обычное сканирование с текущего момента
+                        period_start = None
+                        period_end = None
+                else:
+                    # Продолжение периода - это не должно происходить, так как период уже обработан
+                    # Но на всякий случай оставляем логику
+                    pass
             else:
-                # Продолжение периода - обновляем угол (средний)
-                period_angle = (period_angle + angle) / 2
+                # Угол вне допустимого диапазона - просто пропускаем точку
+                filtered_by_angle_count += 1
+                # Период уже обработан в scan_period_detailed, поэтому просто продолжаем сканирование
         else:
-            # Конец периода видимости
+            # Конец периода видимости (объект не виден)
             if period_start is not None:
                 period_end = current_time
                 period_duration = (period_end - period_start).total_seconds()
@@ -1039,11 +1206,15 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
             }
             sequence.append(period_data)
             
-            # Сохраняем все точки периода в GPKG с частотой 10 секунд
+            # Сохраняем все точки периода в GPKG
             try:
                 save_period_points_to_gpkg(period_start, period_end, len(sequence), orb, target_pos)
             except Exception as e:
                 print(f"  Предупреждение: не удалось сохранить точки периода {len(sequence)} в GPKG: {e}")
+        else:
+            # Отладочная информация о слишком коротких периодах
+            print(f"  Отладочная информация: обнаружен незавершенный период длительностью {period_duration:.1f} сек (минимум {min_period_duration} сек)")
+            print(f"    Начало: {period_start.strftime('%Y-%m-%d %H:%M:%S')}, Конец: {period_end.strftime('%Y-%m-%d %H:%M:%S')}")
     
     print(f"\nСканирование завершено:")
     print(f"  Всего проверено точек: {checked_count}")
@@ -1053,6 +1224,13 @@ def find_visible_periods_for_day(start_date, orb, target_pos, time_step_seconds=
     if filtered_by_angle_count > 0:
         print(f"  Отфильтровано по углу (вне диапазона {angle_min}° - {angle_max}°): {filtered_by_angle_count}")
     print(f"  Найдено периодов видимости: {len(sequence)}")
+    
+    # Дополнительная отладочная информация
+    if visible_count > 0 and len(sequence) == 0:
+        print(f"  Отладочная информация: найдено {visible_count} видимых точек с углом в диапазоне {ANGLE_MIN}-{ANGLE_MAX}°, но периодов не сформировано")
+        print(f"    Возможные причины:")
+        print(f"    - Периоды слишком короткие (меньше {min_period_duration} сек)")
+        print(f"    - Точки слишком редкие (шаг {time_step_seconds} сек) и не объединяются в периоды")
     
     return sequence
 
@@ -1093,23 +1271,8 @@ def export_gpkg_attributes_to_txt(gpkg_file='result/periods_points.gpkg', txt_fi
         # Получаем все колонки (кроме geometry, angle и visible)
         columns = [col for col in gdf.columns if col != 'geometry' and col != 'angle' and col != 'visible']
         
-        # Открываем файл для записи
-        with open(txt_file, 'w', encoding='utf-8') as f:
-            # Записываем заголовок
-            f.write('\t'.join(columns) + '\n')
-            
-            # Записываем данные
-            for idx, row in gdf.iterrows():
-                values = []
-                for col in columns:
-                    val = row[col]
-                    if val is None:
-                        values.append('')
-                    elif isinstance(val, (int, float)):
-                        values.append(str(val))
-                    else:
-                        values.append(str(val))
-                f.write('\t'.join(values) + '\n')
+        # Используем pandas to_csv для эффективного экспорта (вместо построчной записи через iterrows)
+        gdf[columns].to_csv(txt_file, sep='\t', index=False, encoding='utf-8')
         
         print(f"  Атрибуты экспортированы в текстовый файл: {txt_file} ({len(gdf)} записей)")
         
@@ -1134,7 +1297,7 @@ def continuous_angle_sequence():
     start_date = datetime(2024, 3, 22, 0, 0, 0)
     
     # Количество суток для расчета
-    num_days = 1
+    num_days = 16
     
     # Параметры фильтрации по R0 (наклонная дальность)
     R0_min = 561  # Минимальное расстояние R0 в км
@@ -1146,7 +1309,7 @@ def continuous_angle_sequence():
     print(f"Целевая точка: Широта {target_pos[0]}°, Долгота {target_pos[1]}°, Высота {target_pos[2]} км")
     print(f"Период расчета: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')} ({num_days} суток)")
     print(f"Фильтрация по R0: {R0_min} - {R0_max} км")
-    print(f"Фильтрация по углу: 88° - 92° (угол между вектором на цель и направлением скорости)")
+    print(f"Фильтрация по углу: {ANGLE_MIN}° - {ANGLE_MAX}° (угол между вектором на цель и направлением скорости)")
 
     # Находим все периоды видимости за указанный период
     sequence = find_visible_periods_for_day(
@@ -1154,7 +1317,7 @@ def continuous_angle_sequence():
         orb=orb,
         target_pos=target_pos,
         time_step_seconds=10.0,  # Шаг 10 секунд для ускорения
-        min_period_duration=30.0,  # Минимальная длительность периода 30 секунд
+        min_period_duration=5.0,  # Минимальная длительность периода 5 секунд
         R0_min=R0_min,
         R0_max=R0_max,
         num_days=num_days
@@ -1243,7 +1406,7 @@ def continuous_angle_sequence():
                 if image_end_time > period_end_time:
                     # Время окончания снимка выходит за пределы периода
                     print(f"         ⚠️  Примечание: время окончания снимка ({image_end_time.strftime('%Y-%m-%d %H:%M:%S')}) выходит за пределы периода наблюдения ({period_end_time.strftime('%Y-%m-%d %H:%M:%S')})")
-                    print(f"         ⚠️  Период заканчивается раньше, чем заканчивается снимок (вероятно, угол вышел за пределы 88-92°)")
+                    print(f"         ⚠️  Период заканчивается раньше, чем заканчивается снимок (вероятно, угол вышел за пределы {ANGLE_MIN}-{ANGLE_MAX}°)")
                 
                 # Выводим время всех точек для этого снимка
                 if image_num in points_times_by_image and len(points_times_by_image[image_num]) > 0:
@@ -1279,7 +1442,7 @@ def continuous_angle_sequence():
                             time_diff = (image_end_time - last_point_time).total_seconds()
                             if time_diff > 0.2:  # Если разница больше шага точек (0.1 сек), выводим предупреждение
                                 print(f"         ⚠️  Последняя точка ({last_point_time.strftime('%Y-%m-%d %H:%M:%S.%f')}) на {time_diff:.1f} сек раньше времени окончания снимка")
-                                print(f"         ⚠️  Возможные причины: угол вышел за пределы 88-92°, период наблюдения закончился, или точка не прошла фильтры")
+                                print(f"         ⚠️  Возможные причины: угол вышел за пределы {ANGLE_MIN}-{ANGLE_MAX}°, период наблюдения закончился, или точка не прошла фильтры")
                 else:
                     # Если нет точек для этого снимка
                     print(f"         ⚠️  Нет точек для этого снимка (возможно, все точки были отфильтрованы или период закончился до начала снимка)")
@@ -1379,6 +1542,37 @@ def continuous_angle_sequence():
     # Экспорт атрибутов GPKG в текстовый файл для анализа
     export_gpkg_attributes_to_txt()
     
+    # Анализ возможности работы в режиме Staring Spotlight
+    try:
+        print("\n" + "=" * 80)
+        print("АНАЛИЗ ВОЗМОЖНОСТИ РАБОТЫ В РЕЖИМЕ STARING SPOTLIGHT")
+        print("=" * 80)
+        
+        # Подготавливаем данные периодов для анализа
+        periods_for_analysis = []
+        for i, item in enumerate(sequence, 1):
+            periods_for_analysis.append({
+                'period_id': i,
+                'start_time': item['start_time'],
+                'end_time': item['end_time'],
+                'period_duration': item.get('period_duration', 0)
+            })
+        
+        # Выполняем анализ
+        staring_spotlight_results = analyze_periods_for_staring_spotlight(
+            periods_for_analysis,
+            orb,
+            target_pos
+        )
+        
+        # Выводим результаты анализа
+        print_staring_spotlight_analysis(staring_spotlight_results)
+        
+    except Exception as e:
+        print(f"\n⚠️  Предупреждение: не удалось выполнить анализ Staring Spotlight: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # Проверка угла для указанного времени
     check_time = datetime(2024, 3, 22, 3, 58, 37)
     try:
@@ -1390,10 +1584,10 @@ def continuous_angle_sequence():
         print(f"Угол между вектором на цель и направлением скорости: {angle_at_time:.6f}°")
         
         # Проверяем, попадает ли угол в допустимый диапазон
-        if 88.0 <= angle_at_time <= 92.0:
-            print(f"✓ Угол находится в допустимом диапазоне (88-92°)")
+        if ANGLE_MIN <= angle_at_time <= ANGLE_MAX:
+            print(f"✓ Угол находится в допустимом диапазоне ({ANGLE_MIN}-{ANGLE_MAX}°)")
         else:
-            print(f"✗ Угол НЕ в допустимом диапазоне (88-92°)")
+            print(f"✗ Угол НЕ в допустимом диапазоне ({ANGLE_MIN}-{ANGLE_MAX}°)")
         
         # Дополнительная информация
         try:
